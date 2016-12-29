@@ -1,0 +1,189 @@
+---
+title: "Estimating the Causal Effects of Treatments Using Yelp Reviews"
+output: html_document
+author: This work was carried out by Luisa Quispe Ortiz and Varun D N at Center for Data Science, New York University under the guidance of Prof. David Sontag from October 2016 - December 2016. Contact - lqo202@nyu.edu, vdn207@nyu.edu.
+---
+
+This RMD file contains code to predict the ratings from the content of Yelp reviews using the graphical model proposed in the paper titled "Discovery of Treatments from Text Corpora" (http://stanford.edu/~jgrimmer/SE_Short.pdf) by Justin Grimmer and Christian Fong at Stanford University. This module uses the skeleton provided by
+Fong et al. and is modified for working with Yelp dataset.
+
+---
+abstract: Exploring the latent factors influencing the decision of an individual is an interesting problem which enables us to reason their decision. Social scientists examine the effect of contents on individuals’ decisions by conducting experiments involving hand-engineered features known to them beforehand. Automated text analysis methods allow us to identify features from a given textual corpora. But, these techniques do not allow for exploring the causal effects of these features. Fong et al propose a methodology involving a graphical model to simultaneously discover treatments (topics) from text along with the causal effects of them on the individuals’ response. In this work, we use their methodology on Yelp reviews to estimate the causal effects of user expectations on the ratings they provide. We use the model to understand the causal effects on the reviews given for Mexican restaurants in Nevada and reviews from popular cities in UK, Germany, Canada and US.
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Loading the required libraries
+```{r}
+library(MASS)
+library(boot)
+library(ggplot2)
+library(lda)
+
+source("SupervisedIBP.R")
+```
+
+Loading the data and preprocessing. 
+
+YelpDt.csv has the feature counts of selected Yelp reviews. The number of lines in this file indicates the total number of reviews. 'resp' is the user rating which is our target variable. The table is indexed by the review id. 
+
+
+```{r}
+yelp_data <- read.csv("MexV1300_v2/YelpDt_5w.csv")
+
+# Y is the target variable and is standardized. biodata[, -1] means drop the first column and retain everything else. 
+Y <- (yelp_data[,1] - mean(yelp_data[,1]))/sd(yelp_data[,1])
+
+# Take column mean and std. dev.
+X.means <- apply(yelp_data[,-1], 2, mean)
+X.sd <- apply(yelp_data[,-1], 2, sd)
+
+# Standardize the features of input dataframe.
+X <- t(apply(yelp_data[,-1], 1, function(row) (row-X.means)/X.sd))
+```
+
+YelpMult\_5w.txt is a file which has the counts of each feature that appears in each review. The reviews are indexed by a number. They go from 1 to TOTAL\_REVIEWS. The feature id's in YelpMult\_5w.txt start from 0 and not 1.
+
+YelpVocab_nyu.txt has all the features considered.
+
+```{r}
+# Reading in survey id's
+doc.inds <- as.numeric(unlist(lapply(readLines("MexV1300_v2/YelpMult_5w.txt"), 
+                          function(x) strsplit(x, " ")[[1]][1])))
+
+# Reading the document and vocabulary
+documents <- read.documents("MexV1300_v2/YelpMult_5w.txt")  # Doc-term information stored as a big list.
+vocab <- read.vocab("MexV1300_v2/YelpVocab_nyu.txt")
+```
+
+Splitting the data into train and test.
+
+```{r}
+training <- sample(nrow(biodata), size = nrow(biodata)/2)
+test <- setdiff(1:nrow(biodata), training)
+```
+
+Setting priors for our model parameters which include (A, Pi, Z, Beta, Tau).
+```{r}
+# Number of treatments/topics
+K <- 15
+
+# Parameters of Gamma used to sample Tau
+a <- 0.1
+b <- 0.1
+
+# The variance of A_k which is a multivariate normal
+sigmasq.A <- 5
+
+paramslist<-list()
+
+# Search space for alpha which is a paramter for Pi
+alphaseq<-c(3,5,8)
+
+# Variance of (X_i | Z_i, A) ~ MVN
+sigmasqnseq<-seq(0.2, 0.6, by = 0.2)
+
+# Nummber of iterations for learning parameters
+iters<-10
+```
+
+Learning the model parameters for different values of alpha.
+
+```{r}
+# Search across parameter values
+for (alpha in alphaseq){
+  print(alpha)
+  paramslist[[alpha]] <- list()
+  for (sigmasq.n in sigmasqnseq){
+    paramslist[[alpha]][[as.character(sigmasq.n)]] <- list()
+    print(sigmasq.n)
+    for (i in 1:iters){
+      set.seed(5262016 + i)
+      paramslist[[alpha]][[as.character(sigmasq.n)]][[i]] <- 
+        estimate_parameters(Y = Y[training], 
+                            X = X[training,], 
+                            K = K, alpha = alpha, a = a, b = b, 
+                            sigmasq.A = sigmasq.A, 
+                            sigmasq.n = sigmasq.n, silent = TRUE)
+    }
+  }
+}
+```
+
+Calculate the exclusivity for each parameter configuration.
+
+```{r}
+exclusivity_df <- data.frame("alpha" = rep(0,90), "sigmasq.n" = rep(0,90), "iter" = rep(0, 90), "exclu" = rep(0,90))
+ctr <- 1
+for (alpha in alphaseq){
+  print(alpha)
+  for (sigmasq.n in sigmasqnseq){
+    for (i in 1:iters){
+      exclusivity_df$iter[ctr] <- i
+      exclusivity_df$alpha[ctr] <- alpha
+      exclusivity_df$sigmasq.n[ctr] <- sigmasq.n
+      exclusivity_df$exclu[ctr] <- topic_exclusivity(paramslist[[alpha]][[as.character(sigmasq.n)]][[i]], biodata[training,-1], 10)
+      ctr <- ctr + 1
+  }
+  }
+}
+```
+
+The shape of the exclusivity_df is 90 because there are 9 possible parameter configurations and 10 iterations for each config. 
+
+Upon disucssion with the authors, the best paramter configuration must be selected based on manual inspection of the purity of each treatments.
+
+We are analyzing the top 6 configurations based on the exclusivity and chosing the best configuration that answers our hypothesis. Then, we plot a point estimate as well as a 95%-Confidence Interval to visualize the effect. 
+
+The prediction on test data involves predicting the distribution of Z for test reviews. This will be a soft assignment and a binomial distribution is used to make a hard assignment of Z's on the test reviews. Since this is random (but guided by a distribution), the hard assignment is carried out 1000 times. 
+
+A linear regression model is fit between each hard assingment and the user ratings on test documents. The coefficients represent the effect of each topic and a 95% confidence interval is plotted to visualize the causal effects of each topic.
+
+```{r}
+top_k_exclusivity = 6
+ordered_exclusivity = exclusivity_df[ order(-exclusivity_df[,4]), ]
+selected_config = ordered_exclusivity[1:top_k_exclusivity,]
+
+for (c in (1:top_k_exclusivity)){
+  v1 <- selected_config[c,1]
+  v2 <- selected_config[c,2]
+  v3 <- selected_config[c,3]
+  params <- paramslist[[v1]][[v2]][[v3]]
+  apply(params$nu, 2, sum)
+  head(matrix(apply(params$phi, 1, sort, decreasing = TRUE), nrow = ncol(biodata)-1, ncol=K))
+  words <- colnames(biodata)[-1]
+  top.words <- data.frame(matrix(words[apply(params$phi, 1, order, decreasing = TRUE)], nrow = ncol(biodata)-1, ncol=K))
+  print(paste(v1,v2,v3, sep = "/"))
+  print(top.words[1:10,])
+}
+#First three are the same for this experiment, same iteration
+selected_config = paramslist[[8]][['0.6']][[9]]
+
+# Get confidence intervals for the effects of the various treatments
+Z.test <- predict_Z(selected_config, length(test), K, X[test,], alpha, sigmasq.n)
+
+hard.assign.lm<-function(dat, ind){
+  Y <- dat[ind,1]
+  Z <- dat[ind,-1]
+  Z.hard <- apply(Z, 2, function(z) sapply(z, function(zi) rbinom(1,1,zi)))
+  return(coef(lm(Y~Z.hard)))
+}
+
+coef.boot <- boot(cbind(Y[test],Z.test), hard.assign.lm, R = 1000)
+ci.bounds <- apply(coef.boot$t, 2, quantile, probs = c(0.025, 0.975))
+
+cidf <- data.frame(x=factor(1:5), effect = apply(coef.boot$t, 2, mean)[-1], 
+                   L = ci.bounds[1,-1], U = ci.bounds[2,-1])
+
+cidf[,-1] <- cidf[,-1]*sd(biodata[,1])
+print(mean(biodata[,1]))
+
+
+ggplot(cidf, aes(x = x, y = effect)) + geom_errorbar(aes(ymax=U, ymin=L)) + geom_point(size = 5) +
+  theme(axis.text=element_text(size=14), axis.title=element_text(size=16,face="bold"), axis.title.x=element_text(vjust=-0.25)) + 
+  labs(x = "Feature", y = "Effect on Feeling Thermometer") + geom_hline(yintercept = 0, linetype = 2)
+```
+
